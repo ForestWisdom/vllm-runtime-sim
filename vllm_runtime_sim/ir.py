@@ -17,6 +17,8 @@ class RequestWorkload:
     num_computed_tokens: int
     num_scheduled_tokens: int
     speculative_tokens: int = 0
+    prompt_len: int | None = None
+    num_output_tokens: int = 0
 
     @property
     def query_len(self) -> int:
@@ -25,6 +27,16 @@ class RequestWorkload:
     @property
     def seq_len_after_step(self) -> int:
         return self.num_computed_tokens + self.num_scheduled_tokens
+
+    @property
+    def needs_sample(self) -> bool:
+        """Whether this step reaches a position where vLLM should emit a token."""
+        if self.num_output_tokens > 0:
+            return True
+        return (
+            self.prompt_len is not None
+            and self.seq_len_after_step >= self.prompt_len
+        )
 
 
 @dataclass(frozen=True)
@@ -61,6 +73,10 @@ class RuntimeExecutionDescriptor:
     has_lora: bool = False
     num_active_loras: int = 0
     ubatch_count: int = 1
+    # MRV2 BatchExecutionDescriptor fields. They matter for CUDA Graph
+    # specialization but are not available from the older BatchDescriptor.
+    uniform_token_count: int | None = None
+    max_query_len: int | None = None
 
     def __post_init__(self) -> None:
         if self.execution_tokens < self.logical_tokens:
