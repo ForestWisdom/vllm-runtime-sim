@@ -10,7 +10,7 @@ from .ir import (
     RuntimeExecutionDescriptor,
 )
 from .lowering import DenseDecoderConfig, QWEN3_8B, lower_dense_decoder
-from .vllm_adapter import SchedulerOutputAdapter
+from .vllm_adapter import RuntimeContextAdapter, SchedulerOutputAdapter
 
 __all__ = [
     "AnalyticalBackend",
@@ -24,6 +24,7 @@ __all__ = [
     "PhysicalDAG",
     "QWEN3_8B",
     "RequestWorkload",
+    "RuntimeContextAdapter",
     "RuntimeExecutionDescriptor",
     "SchedulerOutputAdapter",
     "lower_dense_decoder",
