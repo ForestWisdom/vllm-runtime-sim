@@ -15,21 +15,22 @@ from .bridge import SimulationStep
 from .execution_hook import SyntheticOutputFactory
 from .ir import CudaGraphMode, RuntimeExecutionDescriptor
 from .lowering import lower_dense_decoder
-from .vllm_adapter import DenseDecoderConfigAdapter, SchedulerOutputAdapter
+from .shadow_cudagraph import ShadowCudaGraphPolicy
+from .vllm_adapter import (
+    DenseDecoderConfigAdapter,
+    RuntimeContextAdapter,
+    SchedulerOutputAdapter,
+)
 
 
 class SimulationWorker(WorkerBase):
     """GPU-free vLLM worker for end-to-end control-plane simulation.
 
-    This worker intentionally does *not* load model weights or allocate a
-    numerical KV cache. It gives EngineCore a logical KV-cache specification so
-    the real vLLM scheduler/block manager can run, then lowers each real
-    SchedulerOutput into the simulator IR and returns a synthetic
-    ModelRunnerOutput.
-
-    The first version uses eager-shaped execution because no GPUModelRunner is
-    instantiated. ``VLLM_SIM_TARGET_TP`` can nevertheless select the physical
-    TP degree used by the operator/collective model.
+    The worker keeps the real EngineCore/Scheduler/KV block manager but does not
+    load weights or allocate numerical KV pages. CUDA Graph *capture/replay* is
+    disabled in the live host config; a private ShadowCudaGraphPolicy reuses
+    vLLM's real CudaGraphManager candidate generation and dispatch logic to
+    recover target FULL/PIECEWISE/NONE decisions and padded execution sizes.
     """
 
     def __init__(
@@ -48,29 +49,44 @@ class SimulationWorker(WorkerBase):
             is_driver_worker=is_driver_worker,
         )
         self.logical_adapter = SchedulerOutputAdapter()
+        self.runtime_adapter = RuntimeContextAdapter()
         self.model_adapter = DenseDecoderConfigAdapter()
         self.backend = AnalyticalBackend()
         self.output_factory = SyntheticOutputFactory()
         self.logical_kv_cache_config: Any | None = None
         self.last_step: SimulationStep | None = None
         self.last_latency_us: float | None = None
+        self.last_cudagraph_policy_error: str | None = None
         self._model = nn.Identity()
+        self.shadow_cudagraph: ShadowCudaGraphPolicy | None = None
 
     def init_device(self) -> None:
-        # A host torch device keeps vLLM's generic worker plumbing satisfied,
-        # but no model runner, CUDA stream, or accelerator allocation is made.
         self.device = torch.device("cpu")
 
+        # Constructing the policy facade does not capture/replay any graph. It
+        # only initializes vLLM's real dispatch candidate table on a private
+        # config clone. Keep a graceful fallback for version churn in this
+        # private vLLM API; strict mode is useful for fidelity testing.
+        try:
+            self.shadow_cudagraph = ShadowCudaGraphPolicy(self.vllm_config)
+        except Exception as exc:  # pragma: no cover - exercised with live vLLM
+            self.last_cudagraph_policy_error = f"{type(exc).__name__}: {exc}"
+            if os.getenv("VLLM_SIM_STRICT_CG_POLICY", "0").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }:
+                raise
+            self.shadow_cudagraph = None
+
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
-        # Deliberately skip weight loading. Model dimensions come from the
-        # already-resolved HF config in vllm_config.model_config.
         return
 
     def get_model(self) -> nn.Module:
         return self._model
 
     def get_supported_tasks(self):
-        # v0 only models causal language generation.
         return ("generate",)
 
     def get_kv_cache_spec(self):
@@ -78,8 +94,6 @@ class SimulationWorker(WorkerBase):
         model = self.model_adapter.extract(self.vllm_config)
         cache_dtype = self.cache_config.cache_dtype
         if cache_dtype != "auto":
-            # Quantized KV layout needs backend-specific storage information;
-            # keep the first GPU-free milestone intentionally conservative.
             raise NotImplementedError(
                 "SimulationWorker currently supports --kv-cache-dtype auto only"
             )
@@ -93,32 +107,53 @@ class SimulationWorker(WorkerBase):
             dtype=self.model_config.dtype,
             kv_quant_mode=kv_quant_mode,
         )
-        # The exact layer keys are opaque to the scheduler for a uniform dense
-        # model; they mainly identify how many cache-owning layers exist.
         return {f"layers.{i}.self_attn": spec for i in range(model.num_layers)}
 
     def determine_available_memory(self) -> int:
-        # Logical capacity only: no bytes are allocated. Keep the default modest
-        # so scheduler metadata does not grow unexpectedly on development hosts.
         return int(os.getenv("VLLM_SIM_KV_CACHE_BYTES", str(2 * 1024**3)))
 
     def initialize_from_config(self, kv_cache_config) -> None:
         self.logical_kv_cache_config = kv_cache_config
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
-        # No kernels, compilation, CUDA Graph capture, or warmup.
         return CompilationTimes(language_model=0.0, encoder=0.0)
 
-    def execute_model(self, scheduler_output):
-        logical = self.logical_adapter.extract(scheduler_output)
-        model = self.model_adapter.extract(self.vllm_config)
+    def _runtime_from_policy(self, logical) -> RuntimeExecutionDescriptor:
         target_tp = int(
             os.getenv(
                 "VLLM_SIM_TARGET_TP",
                 str(self.parallel_config.tensor_parallel_size),
             )
         )
-        runtime = RuntimeExecutionDescriptor(
+
+        if self.shadow_cudagraph is not None:
+            desc = self.shadow_cudagraph.dispatch(logical)
+            runtime = self.runtime_adapter.extract(
+                logical,
+                vllm_config=self.vllm_config,
+                execution_descriptor=desc,
+            )
+            # Actual host worker TP is intentionally 1. Override only the target
+            # hardware degree represented by the physical DAG.
+            return RuntimeExecutionDescriptor(
+                logical_tokens=runtime.logical_tokens,
+                execution_tokens=runtime.execution_tokens,
+                cudagraph_mode=runtime.cudagraph_mode,
+                attention_backend=os.getenv(
+                    "VLLM_SIM_ATTN_BACKEND", "simulated"
+                ),
+                tp_size=target_tp,
+                dtype_bytes=runtime.dtype_bytes,
+                num_requests=runtime.num_requests,
+                uniform_batch=runtime.uniform_batch,
+                has_lora=runtime.has_lora,
+                num_active_loras=runtime.num_active_loras,
+                ubatch_count=runtime.ubatch_count,
+                uniform_token_count=runtime.uniform_token_count,
+                max_query_len=runtime.max_query_len,
+            )
+
+        return RuntimeExecutionDescriptor(
             logical_tokens=logical.logical_tokens,
             execution_tokens=logical.logical_tokens,
             cudagraph_mode=CudaGraphMode.NONE,
@@ -127,6 +162,12 @@ class SimulationWorker(WorkerBase):
             dtype_bytes=self.model_config.dtype.itemsize,
             num_requests=len(logical.requests),
         )
+
+    def execute_model(self, scheduler_output):
+        logical = self.logical_adapter.extract(scheduler_output)
+        model = self.model_adapter.extract(self.vllm_config)
+        runtime = self._runtime_from_policy(logical)
+
         dag = lower_dense_decoder(model, logical, runtime)
         step = SimulationStep(logical=logical, runtime=runtime, model=model, dag=dag)
         latency_us = float(self.backend.estimate_dag_us(dag))
