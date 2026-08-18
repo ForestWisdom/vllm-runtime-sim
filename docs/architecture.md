@@ -42,6 +42,7 @@ Represents serving semantics that should not depend on CUDA Graph padding:
 - ragged query lengths
 - KV lengths
 - speculative token counts
+- prompt completion state used to distinguish partial chunked prefill from a sampling step
 
 ### Runtime execution descriptor
 
@@ -52,14 +53,54 @@ Represents decisions made by the real serving runtime:
 - CUDA Graph mode
 - attention backend
 - dtype width
+- request padding / uniform decode information
+- LoRA specialization key
+- uBatch count
+- MRV2 `uniform_token_count` and `max_query_len`
 
 ### Physical DAG
 
 Represents the hardware work that receives a performance model. Dense GEMMs use the physical execution token count; attention keeps the valid ragged sequence metadata.
 
+## Realization cut
+
+The current prototype installs a reversible hook on a live vLLM model runner. It preserves `execute_model()` until vLLM has selected the execution path, then intercepts one of three realization boundaries:
+
+```text
+                       real GPUModelRunner.execute_model
+                                  |
+                         runtime preparation
+                                  |
+                         CUDA Graph dispatch
+                                  |
+                +-----------------+------------------+
+                |                 |                  |
+             EAGER           PIECEWISE             FULL
+                |                 |                  |
+          model.forward     run_pw_graph       run_fullgraph(desc)
+                |                 |                  |
+                +-----------------+------------------+
+                                  |
+                           SIMULATION CUT
+                                  |
+                     Logical/Runtime -> DAG
+                                  |
+                        performance backend
+                                  |
+                   synthetic ModelRunnerOutput
+```
+
+For eager and PIECEWISE execution, the hook consumes the live `ForwardContext`. For current MRV2 FULL replay, it consumes `BatchExecutionDescriptor` directly because the FULL replay path does not require a live forward context.
+
+The hook also avoids emitting an output token for an incomplete chunked-prefill step. This is necessary because a scheduled prefill chunk is real model work but does not necessarily correspond to a sampling point.
+
+### Current limitation
+
+This cut removes the expensive numerical model forward / CUDA Graph replay, but it is **not yet a completely GPU-free vLLM startup path**. A normal GPU worker still initializes CUDA, model-runner device buffers, KV-cache structures and other device-side state before the hook is reached. The next milestone is a simulation Platform/Worker (or a lower-level device virtualization layer) that allows those initialization paths to run without physical GPUs while preserving as much of vLLM's host-side runtime logic as possible.
+
 ## CUDA Graph
 
-The simulator should not reimplement vLLM's CUDA Graph dispatch policy. vLLM should decide the runtime graph mode and padded `BatchDescriptor`; the simulator consumes that decision and skips actual graph capture/replay.
+The simulator should not reimplement vLLM's CUDA Graph dispatch policy. vLLM should decide the runtime graph mode and padded execution descriptor; the simulator consumes that decision and skips actual graph capture/replay.
 
 Future versions will add execution regions so graph replay/launch overhead is modeled separately from kernel time.
 
@@ -79,7 +120,7 @@ For BF16, each AllReduce payload is `M * 4096 * 2` bytes.
 
 ### Speculative decoding
 
-Add separate fields for verification work and accepted-token feedback. Verification tokens determine current GPU work; accepted tokens determine future scheduler state.
+Add separate fields for verification work and accepted-token feedback. Verification tokens determine current simulated device work; accepted tokens determine future scheduler state.
 
 ### MoE
 
