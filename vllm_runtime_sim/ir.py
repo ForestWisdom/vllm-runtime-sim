@@ -56,12 +56,21 @@ class RuntimeExecutionDescriptor:
     attention_backend: str = "unknown"
     tp_size: int = 1
     dtype_bytes: int = 2
+    num_requests: int | None = None
+    uniform_batch: bool | None = None
+    has_lora: bool = False
+    num_active_loras: int = 0
+    ubatch_count: int = 1
 
     def __post_init__(self) -> None:
         if self.execution_tokens < self.logical_tokens:
             raise ValueError("execution_tokens must be >= logical_tokens")
         if self.tp_size < 1:
             raise ValueError("tp_size must be >= 1")
+        if self.dtype_bytes < 1:
+            raise ValueError("dtype_bytes must be >= 1")
+        if self.ubatch_count < 1:
+            raise ValueError("ubatch_count must be >= 1")
 
 
 @dataclass(frozen=True)
