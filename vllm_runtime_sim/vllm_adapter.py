@@ -9,6 +9,7 @@ from .ir import (
     RequestWorkload,
     RuntimeExecutionDescriptor,
 )
+from .lowering import DenseDecoderConfig
 
 
 @dataclass
@@ -22,8 +23,7 @@ def _enum_name(value: Any) -> str:
     name = getattr(value, "name", None)
     if name is not None:
         return str(name).lower()
-    text = str(value).split(".")[-1].lower()
-    return text
+    return str(value).split(".")[-1].lower()
 
 
 def _cuda_graph_mode(value: Any) -> CudaGraphMode:
@@ -54,9 +54,9 @@ def _dtype_bytes(vllm_config: Any) -> int:
 
 
 def _attention_backend_name(model_runner: Any, forward_context: Any) -> str:
-    # Prefer the initialized runtime backend over static config. Different vLLM
-    # versions expose it through slightly different objects, so keep this duck-typed.
     for obj in (model_runner, forward_context):
+        if obj is None:
+            continue
         for attr in ("attention_backend", "attn_backend", "backend"):
             value = getattr(obj, attr, None)
             if value is not None:
@@ -73,13 +73,51 @@ def _attention_backend_name(model_runner: Any, forward_context: Any) -> str:
     return "unknown"
 
 
-class SchedulerOutputAdapter:
-    """Convert a vLLM V1 SchedulerOutput-like object to LogicalWorkload.
+class DenseDecoderConfigAdapter:
+    """Extract dense decoder dimensions from vLLM's resolved HF text config."""
 
-    This adapter intentionally uses duck typing so the simulation core remains
-    importable without vLLM installed. Worker-side cached state is maintained
-    only for fields that vLLM sends incrementally across scheduling steps.
-    """
+    def extract(self, vllm_config: Any) -> DenseDecoderConfig:
+        model_config = getattr(vllm_config, "model_config", None)
+        hf = getattr(model_config, "hf_text_config", None)
+        if hf is None:
+            hf = getattr(model_config, "hf_config", None)
+        if hf is None:
+            raise ValueError("vllm_config.model_config has no resolved HF config")
+
+        hidden_size = int(getattr(hf, "hidden_size"))
+        intermediate_size = int(getattr(hf, "intermediate_size"))
+        num_layers = int(
+            getattr(hf, "num_hidden_layers", getattr(hf, "num_layers", 0))
+        )
+        num_attention_heads = int(getattr(hf, "num_attention_heads"))
+        num_kv_heads = int(
+            getattr(hf, "num_key_value_heads", num_attention_heads)
+        )
+        head_dim = getattr(hf, "head_dim", None)
+        if head_dim is None:
+            if hidden_size % num_attention_heads:
+                raise ValueError("cannot infer head_dim from hidden_size/num_attention_heads")
+            head_dim = hidden_size // num_attention_heads
+
+        dtype = str(getattr(model_config, "dtype", "bf16")).lower()
+        if "bfloat16" in dtype:
+            dtype = "bf16"
+        elif "float16" in dtype or "half" in dtype:
+            dtype = "fp16"
+
+        return DenseDecoderConfig(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_layers=num_layers,
+            num_attention_heads=num_attention_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=int(head_dim),
+            dtype=dtype,
+        )
+
+
+class SchedulerOutputAdapter:
+    """Convert a vLLM V1 SchedulerOutput-like object to LogicalWorkload."""
 
     def __init__(self) -> None:
         self._requests: dict[str, RequestState] = {}
@@ -128,10 +166,8 @@ class SchedulerOutputAdapter:
 class RuntimeContextAdapter:
     """Extract physical execution choices already made by vLLM.
 
-    The intended call site is immediately after vLLM has prepared its runtime
-    forward context / CUDA Graph dispatch decision and before GPU realization.
-    The adapter consumes the real `ForwardContext.batch_descriptor` instead of
-    reimplementing vLLM's CUDA Graph padding/dispatch policy.
+    Consume the real `ForwardContext.batch_descriptor` instead of reimplementing
+    vLLM's CUDA Graph padding/dispatch policy.
     """
 
     def extract(
