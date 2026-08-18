@@ -1,4 +1,5 @@
 from .backend import AnalyticalBackend, HardwareProfile
+from .bridge import SimulationStep, VllmRuntimeBridge
 from .ir import (
     AttentionOp,
     CollectiveOp,
@@ -32,5 +33,7 @@ __all__ = [
     "RuntimeContextAdapter",
     "RuntimeExecutionDescriptor",
     "SchedulerOutputAdapter",
+    "SimulationStep",
+    "VllmRuntimeBridge",
     "lower_dense_decoder",
 ]
