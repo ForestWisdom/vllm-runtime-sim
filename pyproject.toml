@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vllm-runtime-sim"
+version = "0.1.0"
+description = "Runtime-native simulation backend for vLLM serving"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+vllm = ["vllm"]
+
+[project.entry-points."vllm.platform_plugins"]
+runtime_sim = "vllm_runtime_sim.platform_plugin:register_simulation_platform"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
