@@ -10,7 +10,11 @@ from .ir import (
     RuntimeExecutionDescriptor,
 )
 from .lowering import DenseDecoderConfig, QWEN3_8B, lower_dense_decoder
-from .vllm_adapter import RuntimeContextAdapter, SchedulerOutputAdapter
+from .vllm_adapter import (
+    DenseDecoderConfigAdapter,
+    RuntimeContextAdapter,
+    SchedulerOutputAdapter,
+)
 
 __all__ = [
     "AnalyticalBackend",
@@ -18,6 +22,7 @@ __all__ = [
     "CollectiveOp",
     "CudaGraphMode",
     "DenseDecoderConfig",
+    "DenseDecoderConfigAdapter",
     "GemmOp",
     "HardwareProfile",
     "LogicalWorkload",
