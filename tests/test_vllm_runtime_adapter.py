@@ -3,9 +3,11 @@ from enum import Enum
 
 from vllm_runtime_sim import (
     CudaGraphMode,
+    DenseDecoderConfigAdapter,
     QWEN3_8B,
     RuntimeContextAdapter,
     SchedulerOutputAdapter,
+    VllmRuntimeBridge,
     lower_dense_decoder,
 )
 
@@ -62,10 +64,24 @@ class FakeParallelConfig:
 class FakeDType:
     itemsize: int
 
+    def __str__(self):
+        return "torch.bfloat16"
+
+
+@dataclass
+class FakeHFConfig:
+    hidden_size: int = 4096
+    intermediate_size: int = 12288
+    num_hidden_layers: int = 36
+    num_attention_heads: int = 32
+    num_key_value_heads: int = 8
+    head_dim: int = 128
+
 
 @dataclass
 class FakeModelConfig:
     dtype: FakeDType
+    hf_text_config: FakeHFConfig
 
 
 @dataclass
@@ -85,8 +101,8 @@ class FakeModelRunner:
     attention_backend: object
 
 
-def make_logical():
-    output = FakeSchedulerOutput(
+def make_output():
+    return FakeSchedulerOutput(
         scheduled_new_reqs=[
             FakeNewReq("A", 4096),
             FakeNewReq("B", 2048),
@@ -97,7 +113,16 @@ def make_logical():
         scheduled_spec_decode_tokens={},
         finished_req_ids=set(),
     )
-    return SchedulerOutputAdapter().extract(output)
+
+
+def make_cfg(tp=4):
+    return FakeVllmConfig(
+        FakeParallelConfig(tp), FakeModelConfig(FakeDType(2), FakeHFConfig())
+    )
+
+
+def make_logical():
+    return SchedulerOutputAdapter().extract(make_output())
 
 
 def test_runtime_adapter_consumes_cudagraph_batch_descriptor():
@@ -106,11 +131,10 @@ def test_runtime_adapter_consumes_cudagraph_batch_descriptor():
         FakeCudaGraphMode.FULL,
         FakeBatchDescriptor(num_tokens=576, num_reqs=3, uniform=False),
     )
-    cfg = FakeVllmConfig(FakeParallelConfig(4), FakeModelConfig(FakeDType(2)))
     runner = FakeModelRunner(FakeAttentionBackend())
 
     runtime = RuntimeContextAdapter().extract(
-        logical, vllm_config=cfg, forward_context=ctx, model_runner=runner
+        logical, vllm_config=make_cfg(), forward_context=ctx, model_runner=runner
     )
 
     assert runtime.logical_tokens == 514
@@ -142,10 +166,9 @@ def test_runtime_adapter_preserves_ubatch_count_and_lora_key():
         ),
         ubatch_slices=[object(), object()],
     )
-    cfg = FakeVllmConfig(FakeParallelConfig(4), FakeModelConfig(FakeDType(2)))
 
     runtime = RuntimeContextAdapter().extract(
-        logical, vllm_config=cfg, forward_context=ctx
+        logical, vllm_config=make_cfg(), forward_context=ctx
     )
     assert runtime.cudagraph_mode is CudaGraphMode.PIECEWISE
     assert runtime.ubatch_count == 2
@@ -157,11 +180,40 @@ def test_runtime_adapter_preserves_ubatch_count_and_lora_key():
 def test_runtime_adapter_falls_back_to_eager_logical_shape():
     logical = make_logical()
     ctx = FakeForwardContext(FakeCudaGraphMode.NONE, None)
-    cfg = FakeVllmConfig(FakeParallelConfig(1), FakeModelConfig(FakeDType(2)))
 
     runtime = RuntimeContextAdapter().extract(
-        logical, vllm_config=cfg, forward_context=ctx
+        logical, vllm_config=make_cfg(tp=1), forward_context=ctx
     )
     assert runtime.execution_tokens == logical.logical_tokens
     assert runtime.cudagraph_mode is CudaGraphMode.NONE
     assert runtime.tp_size == 1
+
+
+def test_dense_model_config_is_extracted_from_resolved_vllm_config():
+    model = DenseDecoderConfigAdapter().extract(make_cfg())
+    assert model.hidden_size == 4096
+    assert model.intermediate_size == 12288
+    assert model.num_layers == 36
+    assert model.num_attention_heads == 32
+    assert model.num_kv_heads == 8
+    assert model.head_dim == 128
+    assert model.dtype == "bf16"
+
+
+def test_bridge_builds_full_step_from_live_runtime_objects():
+    ctx = FakeForwardContext(
+        FakeCudaGraphMode.FULL,
+        FakeBatchDescriptor(num_tokens=576, num_reqs=3, uniform=False),
+    )
+    step = VllmRuntimeBridge().build_step(
+        make_output(),
+        vllm_config=make_cfg(),
+        forward_context=ctx,
+        model_runner=FakeModelRunner(FakeAttentionBackend()),
+    )
+
+    assert step.logical.logical_tokens == 514
+    assert step.runtime.execution_tokens == 576
+    assert step.model.hidden_size == 4096
+    qkv = next(op for op in step.dag.operations if op.name == "layer0.qkv")
+    assert (qkv.m, qkv.k, qkv.n) == (576, 4096, 1536)
