@@ -3,18 +3,15 @@ from __future__ import annotations
 from vllm.platforms.cpu import CpuPlatform
 from vllm.platforms.interface import PlatformEnum
 
+from .shadow_cudagraph import persist_policy_snapshot
+
 
 class SimulationPlatform(CpuPlatform):
     """CPU-hosted platform whose worker never executes model numerics.
 
     Reusing CpuPlatform gives vLLM a valid host device and Gloo-compatible
-    control environment. The worker is replaced after CPU config normalization,
-    so no CPU model runner is constructed and no model weights are loaded.
-
-    This first GPU-free path intentionally disables CUDA Graph runtime fidelity;
-    the separate ModelRunnerSimulationHook remains the high-fidelity path when
-    the real GPUModelRunner can be initialized. A later device-virtualization
-    layer will combine both properties.
+    control environment. Before CPU normalization mutates compilation settings,
+    the target CUDA Graph policy is snapshotted for the shadow runtime.
     """
 
     _enum = PlatformEnum.OOT
@@ -22,8 +19,13 @@ class SimulationPlatform(CpuPlatform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config) -> None:
-        # Normalize the configuration into a host-only setup first. In
-        # particular, this disables CUDA graph capture and CUDA-only features.
+        # Preserve the target-device CUDA Graph policy before CpuPlatform clears
+        # CUDA-only capture settings. The worker consumes this snapshot on a
+        # private config clone, so the host-side vLLM lifecycle remains CPU-safe.
+        persist_policy_snapshot(vllm_config)
+
+        # Normalize the live config into a host-only setup. This prevents CUDA
+        # capture/compile/device initialization in the actual worker lifecycle.
         super().check_and_update_config(vllm_config)
 
         parallel = vllm_config.parallel_config
@@ -31,8 +33,6 @@ class SimulationPlatform(CpuPlatform):
 
         # The initial worker is deliberately single-process. Physical TP/EP are
         # represented in the simulator IR instead of spawning device workers.
-        # This is sufficient to prove end-to-end control-plane execution; a
-        # distributed simulation executor is a later milestone.
         if parallel.tensor_parallel_size != 1:
             raise ValueError(
                 "The GPU-free SimulationPlatform currently requires "
